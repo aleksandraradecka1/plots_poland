@@ -1,0 +1,5 @@
+*.duckdb
+*.parquet
+TODO
+logs
+__pycache__
