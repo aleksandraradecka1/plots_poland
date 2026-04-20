@@ -8,6 +8,8 @@ Scripts for downloading, cleaning, and storing Polish real estate transaction an
 
 Downloads property transaction records from the [RCN WFS service](https://mapy.geoportal.gov.pl/wss/service/rcn), cleans and preprocesses them, and saves to DuckDB and/or GeoParquet.
 
+On initialisation the pipeline automatically runs `InflationDataDownloader` to ensure `inflation.csv` is up-to-date. The baseline year and month used for HICP rebasing are written to the log.
+
 Available WFS layers:
 
 | Constant | Layer | Description |
@@ -19,11 +21,12 @@ Available WFS layers:
 
 Pipeline steps (called by `run()`):
 
-1. `connect()` — connects to the WFS endpoint
-2. `download()` — fetches features for the given layer and bounding box
-3. `clean()` — drops nulls, removes zero-price records, IQR-based outlier removal (3×IQR)
-4. `preprocess()` — creates `transaction_id`, parses `dok_data`, computes `price_per_sqm`, adds `lon`/`lat` columns, reprojects to `target_crs`
-5. `save()` — upserts into DuckDB table and/or appends to GeoParquet (deduplication by `transaction_id`)
+1. `_refresh_inflation()` — updates `inflation.csv` and loads HICP data into memory
+2. `connect()` — connects to the WFS endpoint
+3. `download()` — fetches features for the given layer and bounding box
+4. `clean()` — drops nulls, removes zero-price records, IQR-based outlier removal (3×IQR)
+5. `preprocess()` — creates `transaction_id`, parses `dok_data`, computes `price_per_sqm`, adds inflation-normalised columns, adds `lon`/`lat`, reprojects to `target_crs`
+6. `save()` — upserts into DuckDB table and/or appends to GeoParquet (deduplication by `transaction_id`)
 
 Key parameters:
 
@@ -37,16 +40,34 @@ Key parameters:
 | `db_path` | `None` | Required when saving to DuckDB |
 | `parquet_path` | `None` | Required when saving to GeoParquet |
 | `process_data` | `True` | Whether to run `clean()` and `preprocess()` |
+| `inflation_csv_path` | `"price_data/inflation.csv"` | Path to the HICP inflation CSV |
 
 ### `inflation_downloader.py` — `InflationDataDownloader`
 
-Downloads Polish HICP inflation data (all-items, `CP00`) from the [Eurostat API](https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hicp_manr) and saves it as a CSV. Incremental — only fetches months not yet present in the existing file.
+Downloads Polish HICP inflation data (all-items, `CP00`) from the [Eurostat API](https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data) and saves it as a CSV. Incremental — only fetches months not yet present in the existing file. Also computes `hicp_rebased`, which re-anchors the index to a configurable baseline month (default: January 2025 = 100).
 
-Output columns: `year`, `month`, `inflation_value`.
+Output columns:
+
+| Column | Description |
+|---|---|
+| `year` | Year |
+| `month` | Month |
+| `inflation_value` | Year-on-year HICP rate (%) |
+| `hicp_index` | HICP index (Eurostat base: 2015 = 100) |
+| `hicp_rebased` | HICP index rebased to `baseline_year`/`baseline_month` = 100 |
+
+Key parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `csv_path` | `"price_data/inflation.csv"` | Output CSV path |
+| `start_date` | `"1990-01"` | Earliest period to fetch |
+| `baseline_year` | `2025` | Reference year for `hicp_rebased` |
+| `baseline_month` | `1` | Reference month for `hicp_rebased` |
 
 ### `utils.py`
 
-`setup_file_logger(logger, class_name)` — attaches a file handler to a logger, writing to `logs/{ClassName}_{YYYYMMDD_HHMMSS}.log`.
+`setup_file_logger(logger, class_name)` — attaches a file handler to a logger, writing to `<project_root>/logs/{ClassName}_{YYYYMMDD_HHMMSS}.log`.
 
 ## Setup
 
@@ -63,7 +84,7 @@ Run the transaction pipeline directly (defaults to Wilanów apartments, saves to
 python price_data/rcn_pipeline.py
 ```
 
-Run the inflation downloader:
+Run the inflation downloader standalone:
 
 ```bash
 python price_data/inflation_downloader.py
@@ -130,20 +151,22 @@ InflationDataDownloader(csv_path="price_data/inflation.csv").run()
 | transaction_year | 2025 | 2023 | 2021 |
 | transaction_month | 6 | 3 | 4 |
 | price_per_sqm | 20069.57 | 14900.98 | 9310.52 |
+| tran_cena_brutto_norm | 20020.34 | 16043.21 | 12456.78 |
+| price_per_sqm_norm | 268.58 | 199.46 | 124.61 |
 | lon | 21.06277 | 21.11689 | 21.06435 |
 | lat | 52.18701 | 52.17190 | 52.16812 |
 
-`inflation.csv` (first 10 rows):
+`_norm` columns are computed as `col_value * 100 / hicp_rebased` for the transaction's year and month. If the transaction date is newer than the latest available HICP value, the most recent available value is used.
 
-| year | month | inflation_value |
-|------|-------|-----------------|
-| 1997 | 1 | 17.7 |
-| 1997 | 2 | 17.4 |
-| 1997 | 3 | 16.5 |
-| 1997 | 4 | 15.3 |
-| 1997 | 5 | 14.4 |
-| 1997 | 6 | 15.4 |
-| 1997 | 7 | 15.1 |
-| 1997 | 8 | 15.1 |
-| 1997 | 9 | 13.9 |
-| 1997 | 10 | 13.3 |
+`inflation.csv` (sample rows):
+
+| year | month | inflation_value | hicp_index | hicp_rebased |
+|------|-------|-----------------|------------|--------------|
+| 2021 | 4 | 5.1 | 113.2 | 74.42 |
+| 2023 | 3 | 15.2 | 142.7 | 93.82 |
+| 2025 | 1 | 4.3 | 152.1 | 100.00 |
+| 2025 | 6 | 3.4 | 153.5 | 100.92 |
+
+Poland HICP inflation (year-on-year, %) — generated by `InflationDataDownloader.plot_inflation_values()`:
+
+![Poland HICP inflation](inflation_values.png)
