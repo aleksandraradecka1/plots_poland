@@ -1,12 +1,14 @@
 from dataclasses import dataclass, field
 import io
 import logging
+import os
 from typing import Literal, Optional
 
 import geopandas as gpd
 import pandas as pd
 from owslib.wfs import WebFeatureService
 
+from inflation_downloader import InflationDataDownloader
 from utils import setup_file_logger
 
 logger = logging.getLogger(__name__)
@@ -48,8 +50,10 @@ class RCNTransactionPipeline:
     db_path: Optional[str] = None
     parquet_path: Optional[str] = None
     process_data: bool = True
+    inflation_csv_path: str = "price_data/inflation.csv"
 
     _wfs: WebFeatureService = field(default=None, init=False, repr=False)
+    _hicp: pd.DataFrame = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         setup_file_logger(logger, self.__class__.__name__)
@@ -64,6 +68,36 @@ class RCNTransactionPipeline:
             self.layer, self.bbox, self.max_features,
             self.target_crs, self.save_format, self.db_path, self.parquet_path,
         )
+        self._refresh_inflation()
+
+    def _refresh_inflation(self) -> None:
+        """Run InflationDataDownloader to ensure inflation.csv is up-to-date, then load it."""
+        downloader = InflationDataDownloader(csv_path=self.inflation_csv_path)
+        logger.info(
+            "Inflation baseline: %04d-%02d",
+            downloader.baseline_year,
+            downloader.baseline_month,
+        )
+        try:
+            downloader.run()
+        except Exception as exc:
+            logger.warning("Could not refresh inflation data: %s — using existing CSV", exc)
+        self._hicp = pd.read_csv(self.inflation_csv_path)[["year", "month", "hicp_rebased"]]
+        latest = self._hicp.dropna(subset=["hicp_rebased"]).sort_values(["year", "month"]).iloc[-1]
+        logger.info(
+            "HICP data loaded: %d rows, latest available: %04d-%02d (hicp_rebased=%.4f)",
+            len(self._hicp), int(latest["year"]), int(latest["month"]), latest["hicp_rebased"],
+        )
+
+    def _get_hicp_value(self, year: int, month: int) -> float:
+        """Return hicp_rebased for (year, month), falling back to the latest available value."""
+        valid = self._hicp.dropna(subset=["hicp_rebased"])
+        row = valid[(valid["year"] == year) & (valid["month"] == month)]
+        if not row.empty:
+            return float(row["hicp_rebased"].iloc[0])
+        # transaction is newer than latest available — use the most recent value
+        latest = valid.sort_values(["year", "month"]).iloc[-1]
+        return float(latest["hicp_rebased"])
 
     def connect(self) -> None:
         logger.info("Connecting to RCN WFS at %s", WFS_URL)
@@ -128,6 +162,22 @@ class RCNTransactionPipeline:
 
         if "lok_pow_uzyt" in gdf.columns:
             gdf["price_per_sqm"] = gdf[PRICE_COL] / gdf["lok_pow_uzyt"]
+
+        # Inflation-normalised columns (requires transaction_year + transaction_month)
+        if "transaction_year" in gdf.columns and "transaction_month" in gdf.columns:
+            hicp_values = gdf.apply(
+                lambda r: self._get_hicp_value(int(r["transaction_year"]), int(r["transaction_month"])),
+                axis=1,
+            )
+            gdf[f"{PRICE_COL}_norm"] = gdf[PRICE_COL] * 100 / hicp_values
+            logger.info("Computed %s_norm", PRICE_COL)
+            if "price_per_sqm" in gdf.columns:
+                gdf["price_per_sqm_norm"] = gdf["price_per_sqm"] * 100 / hicp_values
+                logger.info("Computed price_per_sqm_norm")
+        else:
+            logger.warning(
+                "transaction_year/transaction_month not available — skipping normalised columns"
+            )
 
         wgs = gdf.geometry.to_crs("EPSG:4326")
         gdf["lon"] = wgs.x
