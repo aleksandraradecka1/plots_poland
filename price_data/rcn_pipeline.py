@@ -328,7 +328,6 @@ class RCNTransactionPipeline:
         """
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
-        import contextily as ctx
         from matplotlib.colors import Normalize
         from matplotlib.cm import ScalarMappable
 
@@ -336,7 +335,6 @@ class RCNTransactionPipeline:
         CMAP_CONTINUOUS = "plasma"
         CMAP_DATE = "spring"
 
-        # Reproject to Web Mercator for contextily basemap
         gdf_wm = gdf.to_crs("EPSG:3857")
 
         fig, axes = plt.subplots(2, 2, figsize=(16, 14))
@@ -346,11 +344,6 @@ class RCNTransactionPipeline:
             ax.tick_params(colors="white", labelsize=7)
             for spine in ax.spines.values():
                 spine.set_edgecolor("#444444")
-
-        basemap_kwargs = dict(
-            source=ctx.providers.CartoDB.DarkMatter,
-            crs=gdf_wm.crs,
-        )
 
         # ── Upper-left: date of transaction ──────────────────────────────────
         ax_date = axes[0, 0]
@@ -378,10 +371,6 @@ class RCNTransactionPipeline:
                 [mdates.num2date(t).strftime("%Y-%m") for t in tick_locs],
                 color="white",
             )
-            try:
-                ctx.add_basemap(ax_date, **basemap_kwargs)
-            except Exception:
-                pass
         ax_date.set_title("Transaction date", color="white", fontsize=10)
         ax_date.set_axis_off()
 
@@ -461,10 +450,6 @@ class RCNTransactionPipeline:
                 edgecolor="#444444",
                 labelcolor="white",
             )
-            try:
-                ctx.add_basemap(ax_rynek, **basemap_kwargs)
-            except Exception:
-                pass
         ax_rynek.set_title("Market type", color="white", fontsize=10)
         ax_rynek.set_axis_off()
 
@@ -503,10 +488,6 @@ class RCNTransactionPipeline:
             cbar2.ax.tick_params(labelcolor="white")
             cbar2.outline.set_edgecolor("#444444")
             ax_price.set_title(f"{price_label}", color="white", fontsize=10)
-            try:
-                ctx.add_basemap(ax_price, **basemap_kwargs)
-            except Exception:
-                pass
         ax_price.set_title(price_label, color="white", fontsize=10)
         ax_price.set_axis_off()
 
