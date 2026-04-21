@@ -33,17 +33,25 @@ class RCNTransactionPipeline:
     cleans and preprocesses it, and saves to DuckDB and/or GeoParquet.
 
     Attributes:
-        layer:          WFS layer to download (default: ms:lokale for apartments).
-        bbox:           Bounding box as (lat_min, lon_min, lat_max, lon_max) in EPSG:4326. Defaults to Warsaw's Mokotów district.
-                        Ignored if area_file is provided.
-        area_file:      Path to geospatial file (GeoJSON, GeoParquet, Shapefile) defining the analysis area.
-                        If provided, convex hull is used for download, then results are clipped to exact geometry.
-        max_features:   Maximum number of features to fetch per request (None = no limit).
-        target_crs:     CRS to reproject geometry to before saving.
-        save_format:    Where to save: "duckdb", "geoparquet", or "both".
-        db_path:        Path to the DuckDB file. Required when save_format is "duckdb" or "both".
-        parquet_path:   Path to the GeoParquet file. Required when save_format is "geoparquet" or "both".
-        process_data:   Whether to run clean() and preprocess(). Defaults to True.
+        layer:              WFS layer to download (default: ms:lokale for apartments).
+        bbox:               Bounding box as (lat_min, lon_min, lat_max, lon_max) in EPSG:4326.
+                            Defaults to Warsaw's Mokotów district. Ignored if area_file is set.
+        area_file:          Path to a geospatial file (GeoJSON, GeoParquet, Shapefile) defining
+                            the analysis area. Convex hull is used for the WFS download; results
+                            are then clipped to the exact geometry. File must have a CRS defined.
+        max_features:       Maximum number of features per WFS request (None = no limit).
+                            In parallel mode this cap applies per tile.
+        target_crs:         CRS to reproject geometry to before saving. Default: EPSG:2180.
+        save_format:        Output destination: "duckdb", "geoparquet", or "both".
+        db_path:            Path to the DuckDB file. Required when save_format is "duckdb" or "both".
+        parquet_path:       Path to the GeoParquet file. Required when save_format is "geoparquet" or "both".
+        process_data:       Whether to run clean() and preprocess(). Defaults to True.
+        download_mode:      "sequential" (default) or "parallel". Parallel mode requires ray + tqdm.
+        grid_size:          Number of subdivisions along each axis in parallel mode (default 4,
+                            producing 16 tiles). Must be >= 1.
+        cpu_fraction:       Fraction of available CPU cores to allocate as Ray workers (default 0.5).
+                            Must be in (0.0, 1.0]. Ignored in sequential mode.
+        inflation_csv_path: Path to the HICP inflation CSV maintained by InflationDataDownloader.
     """
 
     layer: str = LAYER_LOKALE

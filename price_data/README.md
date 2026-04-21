@@ -12,6 +12,11 @@ On initialisation the pipeline automatically runs `InflationDataDownloader` to e
 
 The analysis area can be defined either as a bounding box (`bbox`) or via a geospatial file (`area_file` — GeoJSON, GeoParquet, or Shapefile). When `area_file` is used, the convex hull of the file's geometry is used for the WFS download, and results are then clipped to the exact shape. The file must have a CRS defined.
 
+Two download modes are supported:
+
+- **`"sequential"`** (default) — issues a single WFS request for the full bbox. No extra dependencies.
+- **`"parallel"`** — subdivides the bbox into a `grid_size × grid_size` grid of tiles and fetches each tile concurrently using [Ray](https://www.ray.io/). A `tqdm` progress bar shows tile completion. After all tiles are collected, results are deduplicated by `teryt + tran_lokalny_id_iip` (the natural transaction key) before being merged. Requires `ray` and `tqdm` (`pip install ray tqdm`).
+
 Available WFS layers:
 
 | Constant | Layer | Description |
@@ -24,12 +29,11 @@ Available WFS layers:
 Pipeline steps (called by `run()`):
 
 1. `_refresh_inflation()` — updates `inflation.csv` and loads HICP data into memory
-2. `connect()` — connects to the WFS endpoint
-3. `download()` — fetches features for the given layer and bbox (derived from `area_file` if provided), then clips to exact area geometry
-4. `clean()` — drops nulls, removes zero-price records, IQR-based outlier removal (3×IQR)
-5. `preprocess()` — creates `transaction_id`, parses `dok_data`, computes `price_per_sqm`, adds inflation-normalised columns, adds `lon`/`lat`, reprojects to `target_crs`
-6. `save()` — upserts into DuckDB table and/or appends to GeoParquet (deduplication by `transaction_id`)
-7. `plot_transactions()` — generates a 2×2 summary plot saved as `data_plot.png`
+2. `download()` — fetches features; routes to `_parallel_download()` when `download_mode="parallel"`, otherwise issues a single sequential WFS request; clips to exact area geometry if `area_file` was provided
+3. `clean()` — drops nulls, removes zero-price records, IQR-based outlier removal (3×IQR)
+4. `preprocess()` — creates `transaction_id`, parses `dok_data`, computes `price_per_sqm`, adds inflation-normalised columns, adds `lon`/`lat`, reprojects to `target_crs`
+5. `save()` — upserts into DuckDB table and/or appends to GeoParquet (deduplication by `transaction_id`)
+6. `plot_transactions()` — generates a 2×2 summary plot saved as `data_plot.png`
 
 Key parameters:
 
@@ -38,12 +42,15 @@ Key parameters:
 | `layer` | `ms:lokale` | WFS layer to download |
 | `bbox` | Mokotów district | `(lat_min, lon_min, lat_max, lon_max)` in EPSG:4326. Ignored if `area_file` is set |
 | `area_file` | `None` | Path to a geospatial file defining the analysis area |
-| `max_features` | `None` | Cap on features per request |
+| `max_features` | `None` | Cap on features per request (per tile in parallel mode) |
 | `target_crs` | `EPSG:2180` | Output CRS for geometry |
 | `save_format` | `"duckdb"` | `"duckdb"`, `"geoparquet"`, or `"both"` |
 | `db_path` | `None` | Required when saving to DuckDB |
 | `parquet_path` | `None` | Required when saving to GeoParquet |
 | `process_data` | `True` | Whether to run `clean()` and `preprocess()` |
+| `download_mode` | `"sequential"` | `"sequential"` or `"parallel"` |
+| `grid_size` | `4` | Tiles per axis in parallel mode (produces `grid_size²` tiles). Must be >= 1 |
+| `cpu_fraction` | `0.5` | Fraction of CPU cores to allocate as Ray workers. Must be in `(0.0, 1.0]` |
 | `inflation_csv_path` | `"price_data/inflation.csv"` | Path to the HICP inflation CSV |
 
 ### `inflation_downloader.py` — `InflationDataDownloader`
@@ -71,7 +78,11 @@ Key parameters:
 
 ### `utils.py`
 
-`setup_file_logger(logger, class_name)` — attaches a file handler to a logger, writing to `<project_root>/logs/{ClassName}_{YYYYMMDD_HHMMSS}.log`.
+Shared utilities used by the pipeline modules.
+
+- `setup_file_logger(logger, class_name, log_dir)` — attaches a timestamped file handler to a logger, writing to `{log_dir}/{ClassName}_{YYYYMMDD_HHMMSS}.log`. Both `rcn_pipeline.py` and `inflation_downloader.py` write logs to `price_data/logs/`.
+- `generate_grid_tiles(bbox, grid_size)` — splits a `(lat_min, lon_min, lat_max, lon_max)` bbox into `grid_size²` non-overlapping tiles. Used by `_parallel_download`.
+- `fetch_tile_remote(tile_bbox, wfs_url, layer, srsname, max_features)` — fetches a single tile from the WFS and returns a `GeoDataFrame`. Creates a fresh connection per call so it is safe to run as a Ray remote task.
 
 ## Setup
 
@@ -99,12 +110,26 @@ Or configure and run from a script/notebook:
 ```python
 from price_data.rcn_pipeline import RCNTransactionPipeline
 
+# Sequential (default)
 pipeline = RCNTransactionPipeline(
     layer="ms:lokale",
     bbox=(52.155, 21.055, 52.200, 21.130),  # (lat_min, lon_min, lat_max, lon_max)
     save_format="both",
     db_path="plots_poland.duckdb",
     parquet_path="lokale_mokotow.parquet",
+)
+pipeline.run()
+
+# Parallel — 4×4 grid of tiles, 50% of CPU cores allocated to Ray
+pipeline = RCNTransactionPipeline(
+    layer="ms:lokale",
+    area_file="mokotow_district.geojson",
+    save_format="both",
+    db_path="plots_poland.duckdb",
+    parquet_path="lokale_mokotow.parquet",
+    download_mode="parallel",
+    grid_size=4,
+    cpu_fraction=0.5,
 )
 pipeline.run()
 ```
