@@ -26,7 +26,7 @@ class InflationDataDownloader:
     baseline_month: int = 1
 
     def __post_init__(self) -> None:
-        setup_file_logger(logger, self.__class__.__name__)
+        setup_file_logger(logger, self.__class__.__name__, log_dir=Path(__file__).parent / "logs")
         logger.info(
             "InflationDataDownloader initialised  csv_path=%s  start_date=%s  baseline=%04d-%02d",
             self.csv_path,

@@ -10,7 +10,7 @@ import pandas as pd
 from owslib.wfs import WebFeatureService
 
 from inflation_downloader import InflationDataDownloader
-from utils import setup_file_logger
+from utils import setup_file_logger, generate_grid_tiles, fetch_tile_remote
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,9 @@ class RCNTransactionPipeline:
     db_path: Optional[str] = None
     parquet_path: Optional[str] = None
     process_data: bool = True
+    download_mode: Literal["sequential", "parallel"] = "sequential"
+    grid_size: int = 4
+    cpu_fraction: float = 0.5
     inflation_csv_path: str = str(Path(__file__).parent / "inflation.csv")
 
     _wfs: WebFeatureService = field(default=None, init=False, repr=False)
@@ -63,6 +66,16 @@ class RCNTransactionPipeline:
 
     def __post_init__(self) -> None:
         setup_file_logger(logger, self.__class__.__name__, log_dir=Path(__file__).parent / "logs")
+        if self.download_mode not in ("sequential", "parallel"):
+            raise ValueError(
+                f"download_mode must be 'sequential' or 'parallel', got {self.download_mode!r}"
+            )
+        if self.grid_size < 1:
+            raise ValueError(f"grid_size must be >= 1, got {self.grid_size}")
+        if self.cpu_fraction <= 0.0 or self.cpu_fraction > 1.0:
+            raise ValueError(
+                f"cpu_fraction must be in (0.0, 1.0], got {self.cpu_fraction}"
+            )
         if self.save_format in ("duckdb", "both") and not self.db_path:
             raise ValueError("db_path is required when save_format is 'duckdb' or 'both'.")
         if self.save_format in ("geoparquet", "both") and not self.parquet_path:
@@ -72,9 +85,11 @@ class RCNTransactionPipeline:
         logger.info(
             "RCNTransactionPipeline initialised\n"
             "  layer=%s\n  bbox=%s\n  area_file=%s\n  max_features=%s\n"
-            "  target_crs=%s\n  save_format=%s\n  db_path=%s\n  parquet_path=%s",
+            "  target_crs=%s\n  save_format=%s\n  db_path=%s\n  parquet_path=%s\n"
+            "  download_mode=%s\n  grid_size=%s\n  cpu_fraction=%s",
             self.layer, self.bbox, self.area_file, self.max_features,
             self.target_crs, self.save_format, self.db_path, self.parquet_path,
+            self.download_mode, self.grid_size, self.cpu_fraction,
         )
         self._refresh_inflation()
 
@@ -143,7 +158,90 @@ class RCNTransactionPipeline:
         logger.info("Connecting to RCN WFS at %s", WFS_URL)
         self._wfs = WebFeatureService(url=WFS_URL, version="2.0.0")
 
+    def _parallel_download(self) -> gpd.GeoDataFrame:
+        """Download tiles in parallel using Ray. Lazy-imports ray and tqdm."""
+        try:
+            import ray
+            from tqdm import tqdm
+        except ImportError as exc:
+            raise ImportError(
+                f"Parallel download requires 'ray' and 'tqdm'. "
+                f"Install them with: pip install ray tqdm\n(original error: {exc})"
+            ) from exc
+
+        worker_count = max(1, int(os.cpu_count() * self.cpu_fraction))
+        tiles = generate_grid_tiles(self.bbox, self.grid_size)
+        logger.info(
+            "Parallel download: grid=%dx%d, tiles=%d, bbox=%s, workers=%d",
+            self.grid_size, self.grid_size, len(tiles), self.bbox, worker_count,
+        )
+
+        try:
+            ray.init(num_cpus=worker_count, ignore_reinit_error=True)
+        except Exception as exc:
+            logger.error("Ray initialisation failed: %s", exc)
+            raise
+
+        # Apply @ray.remote decorator at runtime so module stays importable without ray
+        remote_fn = ray.remote(fetch_tile_remote)
+
+        futures = [
+            remote_fn.remote(tile, WFS_URL, self.layer, "EPSG:2180", self.max_features)
+            for tile in tiles
+        ]
+
+        successful_gdfs: list[gpd.GeoDataFrame] = []
+        remaining = list(futures)
+
+        with tqdm(total=len(tiles), desc="Downloading tiles") as pbar:
+            while remaining:
+                done, remaining = ray.wait(remaining, num_returns=1)
+                ref = done[0]
+                try:
+                    gdf_tile = ray.get(ref)
+                    logger.info(
+                        "Tile fetched: %d features", len(gdf_tile)
+                    )
+                    successful_gdfs.append(gdf_tile)
+                except Exception as exc:
+                    logger.warning("Tile failed: %s", exc)
+                pbar.update(1)
+
+        if not successful_gdfs:
+            logger.warning("All tiles failed — returning empty GeoDataFrame")
+            return gpd.GeoDataFrame()
+
+        merged = pd.concat(successful_gdfs, ignore_index=True)
+        n_before = len(merged)
+        # Deduplicate by the natural transaction key (teryt + tran_lokalny_id_iip) —
+        # two transactions can share the same geometry (e.g. same building).
+        if "tran_lokalny_id_iip" in merged.columns and "teryt" in merged.columns:
+            merged["_dedup_key"] = merged["teryt"].astype(str) + "_" + merged["tran_lokalny_id_iip"].astype(str)
+            merged = merged.drop_duplicates(subset="_dedup_key").drop(columns="_dedup_key")
+        else:
+            logger.warning("teryt/tran_lokalny_id_iip columns not found — skipping deduplication")
+        merged = gpd.GeoDataFrame(merged, geometry="geometry", crs=successful_gdfs[0].crs)
+        logger.info("Merged tiles: %d features before dedup, %d after", n_before, len(merged))
+
+        # Reproject to target_crs if needed
+        if merged.crs is not None and merged.crs.to_string() != self.target_crs:
+            merged = merged.to_crs(self.target_crs)
+
+        # Apply area clip if area_file was provided
+        if self._area_geom is not None:
+            n_before_clip = len(merged)
+            if merged.crs != self._area_geom.crs:
+                merged = merged.to_crs(self._area_geom.crs)
+            clip_geom = self._area_geom.union_all()
+            merged = merged[merged.intersects(clip_geom)]
+            merged = gpd.GeoDataFrame(merged, geometry="geometry", crs=self._area_geom.crs)
+            logger.info("Clipped to area_file geometry: %d → %d features", n_before_clip, len(merged))
+
+        return merged
+
     def download(self) -> gpd.GeoDataFrame:
+        if self.download_mode == "parallel":
+            return self._parallel_download()
         if self._wfs is None:
             self.connect()
 
@@ -297,6 +395,20 @@ class RCNTransactionPipeline:
 
         if os.path.exists(self.parquet_path):
             existing = gpd.read_parquet(self.parquet_path)
+            # Normalise object columns to avoid pyarrow type conflicts on concat
+            for col in existing.select_dtypes(include="object").columns:
+                if col == "geometry":
+                    continue
+                existing[col] = existing[col].apply(
+                    lambda v: v.decode() if isinstance(v, bytes) else (str(v) if v is not None else None)
+                )
+            # Cast teryt to str in both frames if present to avoid int64/str conflicts
+            for col in ("teryt",):
+                if col in existing.columns:
+                    existing[col] = existing[col].astype(str)
+                if col in gdf.columns:
+                    gdf = gdf.copy()
+                    gdf[col] = gdf[col].astype(str)
             if "transaction_id" in existing.columns:
                 known_ids = set(existing["transaction_id"])
                 gdf = gdf[~gdf["transaction_id"].isin(known_ids)]
@@ -515,5 +627,6 @@ if __name__ == "__main__":
         save_format="both",
         db_path=str(_here / "lokale_mokotow.duckdb"),
         parquet_path=str(_here / "lokale_mokotow.parquet"),
+        download_mode="parallel",
     )
     pipeline.run()
