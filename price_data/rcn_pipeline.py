@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import io
 import logging
 import os
+from pathlib import Path
 from typing import Literal, Optional
 
 import geopandas as gpd
@@ -33,7 +34,10 @@ class RCNTransactionPipeline:
 
     Attributes:
         layer:          WFS layer to download (default: ms:lokale for apartments).
-        bbox:           Bounding box as (lat_min, lon_min, lat_max, lon_max) in EPSG:4326. Defaults to Warsaw's Wilanów district.
+        bbox:           Bounding box as (lat_min, lon_min, lat_max, lon_max) in EPSG:4326. Defaults to Warsaw's Mokotów district.
+                        Ignored if area_file is provided.
+        area_file:      Path to geospatial file (GeoJSON, GeoParquet, Shapefile) defining the analysis area.
+                        If provided, convex hull is used for download, then results are clipped to exact geometry.
         max_features:   Maximum number of features to fetch per request (None = no limit).
         target_crs:     CRS to reproject geometry to before saving.
         save_format:    Where to save: "duckdb", "geoparquet", or "both".
@@ -43,32 +47,68 @@ class RCNTransactionPipeline:
     """
 
     layer: str = LAYER_LOKALE
-    bbox: tuple = (52.155, 21.055, 52.200, 21.130)  # Warsaw, Wilanów district
+    bbox: Optional[tuple] = (52.125, 20.950, 52.245, 21.070)  # Warsaw, Mokotów district
+    area_file: Optional[str] = None
     max_features: Optional[int] = None
     target_crs: str = "EPSG:2180"
     save_format: SaveFormat = "duckdb"
     db_path: Optional[str] = None
     parquet_path: Optional[str] = None
     process_data: bool = True
-    inflation_csv_path: str = "price_data/inflation.csv"
+    inflation_csv_path: str = str(Path(__file__).parent / "inflation.csv")
 
     _wfs: WebFeatureService = field(default=None, init=False, repr=False)
     _hicp: pd.DataFrame = field(default=None, init=False, repr=False)
+    _area_geom: gpd.GeoDataFrame = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        setup_file_logger(logger, self.__class__.__name__)
+        setup_file_logger(logger, self.__class__.__name__, log_dir=Path(__file__).parent / "logs")
         if self.save_format in ("duckdb", "both") and not self.db_path:
             raise ValueError("db_path is required when save_format is 'duckdb' or 'both'.")
         if self.save_format in ("geoparquet", "both") and not self.parquet_path:
             raise ValueError("parquet_path is required when save_format is 'geoparquet' or 'both'.")
+        if self.area_file is not None:
+            self._load_area_file()
         logger.info(
             "RCNTransactionPipeline initialised\n"
-            "  layer=%s\n  bbox=%s\n  max_features=%s\n"
+            "  layer=%s\n  bbox=%s\n  area_file=%s\n  max_features=%s\n"
             "  target_crs=%s\n  save_format=%s\n  db_path=%s\n  parquet_path=%s",
-            self.layer, self.bbox, self.max_features,
+            self.layer, self.bbox, self.area_file, self.max_features,
             self.target_crs, self.save_format, self.db_path, self.parquet_path,
         )
         self._refresh_inflation()
+
+    def _load_area_file(self) -> None:
+        """Load area geometry from a geospatial file and derive bbox in EPSG:4326 from its convex hull."""
+        path = Path(self.area_file)
+        if not path.exists():
+            raise FileNotFoundError(f"area_file not found: {self.area_file}")
+
+        suffix = path.suffix.lower()
+        if suffix == ".parquet":
+            area = gpd.read_parquet(self.area_file)
+        else:
+            # covers .geojson, .json, .shp, .gpkg, etc.
+            area = gpd.read_file(self.area_file)
+
+        if area.crs is None:
+            raise ValueError(
+                f"area_file '{self.area_file}' has no CRS defined. "
+                "Please set the CRS before using it as an analysis area."
+            )
+
+        # Reproject to EPSG:4326 for WFS bbox and to target_crs for clipping
+        area_4326 = area.to_crs("EPSG:4326")
+        self._area_geom = area.to_crs(self.target_crs)
+
+        # Derive bbox from convex hull bounds: (lat_min, lon_min, lat_max, lon_max)
+        hull = area_4326.union_all().convex_hull
+        minx, miny, maxx, maxy = hull.bounds  # (lon_min, lat_min, lon_max, lat_max)
+        self.bbox = (miny, minx, maxy, maxx)
+        logger.info(
+            "Loaded area_file '%s' (%d features, CRS=%s) → bbox=%s",
+            self.area_file, len(area), area.crs.to_string(), self.bbox,
+        )
 
     def _refresh_inflation(self) -> None:
         """Run InflationDataDownloader to ensure inflation.csv is up-to-date, then load it."""
@@ -120,6 +160,18 @@ class RCNTransactionPipeline:
         response = self._wfs.getfeature(**kwargs)
         gdf = gpd.read_file(io.BytesIO(response.read()))
         logger.info("Downloaded %d features", len(gdf))
+
+        # Clip to exact area geometry if area_file was provided
+        if self._area_geom is not None:
+            n_before = len(gdf)
+            # Ensure same CRS for clipping
+            if gdf.crs != self._area_geom.crs:
+                gdf = gdf.to_crs(self._area_geom.crs)
+            # Clip to the union of all area geometries
+            clip_geom = self._area_geom.union_all()
+            gdf = gdf[gdf.intersects(clip_geom)]
+            logger.info("Clipped to area_file geometry: %d → %d features", n_before, len(gdf))
+
         return gdf
 
     def clean(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -134,6 +186,24 @@ class RCNTransactionPipeline:
 
         if "transaction_id" in gdf.columns:
             gdf = gdf.drop_duplicates(subset="transaction_id")
+
+        if "dok_data" in gdf.columns:
+            parsed = pd.to_datetime(gdf["dok_data"], errors="coerce", utc=True)
+            today = pd.Timestamp.now(tz="UTC")
+            earliest_before = parsed.min()
+            mask = (
+                parsed.notna() &
+                parsed.dt.day.between(1, 31) &
+                parsed.dt.month.between(1, 12) &
+                (parsed.dt.year >= 1990) &
+                (parsed <= today)
+            )
+            gdf = gdf[mask]
+            earliest_after = parsed[mask].min()
+            logger.info(
+                "dok_data filter: earliest %s -> %s (removed %d rows)",
+                earliest_before.date(), earliest_after.date(), (~mask).sum(),
+            )
 
         q1 = gdf[PRICE_COL].quantile(0.25)
         q3 = gdf[PRICE_COL].quantile(0.75)
@@ -166,7 +236,9 @@ class RCNTransactionPipeline:
         # Inflation-normalised columns (requires transaction_year + transaction_month)
         if "transaction_year" in gdf.columns and "transaction_month" in gdf.columns:
             hicp_values = gdf.apply(
-                lambda r: self._get_hicp_value(int(r["transaction_year"]), int(r["transaction_month"])),
+                lambda r: self._get_hicp_value(int(r["transaction_year"]), int(r["transaction_month"]))
+                if pd.notna(r["transaction_year"]) and pd.notna(r["transaction_month"])
+                else float("nan"),
                 axis=1,
             )
             gdf[f"{PRICE_COL}_norm"] = gdf[PRICE_COL] * 100 / hicp_values
@@ -243,20 +315,224 @@ class RCNTransactionPipeline:
         if self.save_format in ("geoparquet", "both"):
             self._save_geoparquet(gdf)
 
+    def plot_transactions(self, gdf: gpd.GeoDataFrame, output_path: str = "transactions_plot.png") -> None:
+        """
+        Create a 2x2 subplot summary of transaction data and save as PNG.
+
+        Subplots:
+          - Upper-left:  Map coloured by transaction date (continuous palette)
+          - Upper-right: Scatter plot of dok_data vs price_per_sqm
+          - Lower-left:  Map coloured by tran_rodzaj_rynku (market type)
+          - Lower-right: Map coloured by price_per_sqm_norm, fallback to
+                         tran_cena_brutto_norm, then tran_cena_brutto
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        import contextily as ctx
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+
+        BG = "#0d0d0d"
+        CMAP_CONTINUOUS = "plasma"
+        CMAP_DATE = "spring"
+
+        # Reproject to Web Mercator for contextily basemap
+        gdf_wm = gdf.to_crs("EPSG:3857")
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+        fig.patch.set_facecolor(BG)
+        for ax in axes.flat:
+            ax.set_facecolor(BG)
+            ax.tick_params(colors="white", labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#444444")
+
+        basemap_kwargs = dict(
+            source=ctx.providers.CartoDB.DarkMatter,
+            crs=gdf_wm.crs,
+        )
+
+        # ── Upper-left: date of transaction ──────────────────────────────────
+        ax_date = axes[0, 0]
+        if "dok_data" in gdf_wm.columns:
+            dates = pd.to_datetime(gdf_wm["dok_data"])
+            date_num = mdates.date2num(dates)
+            norm = Normalize(vmin=date_num.min(), vmax=date_num.max())
+            gdf_wm.plot(
+                ax=ax_date,
+                column=date_num,
+                cmap=CMAP_DATE,
+                norm=norm,
+                markersize=4,
+                alpha=0.8,
+                legend=False,
+            )
+            sm = ScalarMappable(cmap=CMAP_DATE, norm=norm)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax_date, fraction=0.03, pad=0.02)
+            cbar.ax.yaxis.set_tick_params(color="white", labelsize=7)
+            cbar.outline.set_edgecolor("#444444")
+            tick_locs = norm.vmin + (norm.vmax - norm.vmin) * pd.Series([0, 0.25, 0.5, 0.75, 1.0])
+            cbar.set_ticks(tick_locs.tolist())
+            cbar.set_ticklabels(
+                [mdates.num2date(t).strftime("%Y-%m") for t in tick_locs],
+                color="white",
+            )
+            try:
+                ctx.add_basemap(ax_date, **basemap_kwargs)
+            except Exception:
+                pass
+        ax_date.set_title("Transaction date", color="white", fontsize=10)
+        ax_date.set_axis_off()
+
+        # ── Upper-right: scatter dok_data vs price_per_sqm ───────────────────
+        ax_scatter = axes[0, 1]
+        ax_scatter.set_facecolor(BG)
+        if "dok_data" in gdf.columns and "price_per_sqm" in gdf.columns:
+            scatter_df = gdf[["dok_data", "price_per_sqm"]].dropna()
+            # clip to 2nd–98th percentile to remove extreme outliers from display
+            p_low = scatter_df["price_per_sqm"].quantile(0.02)
+            p_high = scatter_df["price_per_sqm"].quantile(0.98)
+            scatter_df = scatter_df[
+                scatter_df["price_per_sqm"].between(p_low, p_high)
+            ]
+            dates_s = pd.to_datetime(scatter_df["dok_data"])
+            ax_scatter.scatter(
+                dates_s,
+                scatter_df["price_per_sqm"],
+                s=6,
+                alpha=0.5,
+                color="#e040fb",
+                linewidths=0,
+            )
+            # Trend line via numpy polyfit on numeric dates
+            import numpy as np
+            date_num = mdates.date2num(dates_s)
+            z = np.polyfit(date_num, scatter_df["price_per_sqm"], 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(date_num.min(), date_num.max(), 200)
+            ax_scatter.plot(
+                mdates.num2date(x_line), p(x_line),
+                color="#ffffff", linewidth=1.5, alpha=0.8, label="trend",
+            )
+            ax_scatter.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+            ax_scatter.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax_scatter.get_xticklabels(), rotation=30, ha="right")
+            ax_scatter.set_xlabel("Transaction date", color="white", fontsize=8)
+            ax_scatter.set_ylabel("Price per sqm (PLN)", color="white", fontsize=8)
+        else:
+            ax_scatter.text(
+                0.5, 0.5, "date / price per sqm\nnot available",
+                ha="center", va="center", color="white", transform=ax_scatter.transAxes,
+            )
+        ax_scatter.set_title("Date vs price per sqm", color="white", fontsize=10)
+        ax_scatter.tick_params(colors="white", labelsize=7)
+        for spine in ax_scatter.spines.values():
+            spine.set_edgecolor("#444444")
+
+        # ── Lower-left: tran_rodzaj_rynku ────────────────────────────────────
+        ax_rynek = axes[1, 0]
+        MARKET_LABEL_MAP = {"pierwotny": "primary", "wtorny": "secondary"}
+        if "tran_rodzaj_rynku" in gdf_wm.columns:
+            categories = gdf_wm["tran_rodzaj_rynku"].astype("category")
+            cat_codes = categories.cat.codes
+            unique_cats = categories.cat.categories.tolist()
+            MARKET_COLORS = ["#00bfff", "#c8a882"]  # cyan-blue vs light brown
+            cmap_cat = plt.get_cmap("Set2", len(unique_cats))
+            color_list = [MARKET_COLORS[i] if i < len(MARKET_COLORS) else cmap_cat(i) for i in range(len(unique_cats))]
+            point_colors = [color_list[code] for code in cat_codes]
+            gdf_wm.plot(
+                ax=ax_rynek,
+                color=point_colors,
+                markersize=4,
+                alpha=0.8,
+            )
+            # Manual legend patches
+            from matplotlib.patches import Patch
+            patches = [
+                Patch(color=color_list[i], label=MARKET_LABEL_MAP.get(str(cat), str(cat)))
+                for i, cat in enumerate(unique_cats)
+            ]
+            ax_rynek.legend(
+                handles=patches,
+                loc="lower left",
+                fontsize=7,
+                facecolor=BG,
+                edgecolor="#444444",
+                labelcolor="white",
+            )
+            try:
+                ctx.add_basemap(ax_rynek, **basemap_kwargs)
+            except Exception:
+                pass
+        ax_rynek.set_title("Market type", color="white", fontsize=10)
+        ax_rynek.set_axis_off()
+
+        # ── Lower-right: price map (norm > brutto_norm > brutto) ─────────────
+        ax_price = axes[1, 1]
+        if "price_per_sqm_norm" in gdf_wm.columns:
+            price_col = "price_per_sqm_norm"
+            price_label = "Price/sqm normalised (PLN)"
+        elif "tran_cena_brutto_norm" in gdf_wm.columns:
+            price_col = "tran_cena_brutto_norm"
+            price_label = "Gross price normalised (PLN)"
+        else:
+            price_col = PRICE_COL
+            price_label = "Gross price (PLN)"
+
+        plot_gdf = gdf_wm.dropna(subset=[price_col])
+        if not plot_gdf.empty:
+            from matplotlib.colors import Normalize as MNorm
+            p_norm = MNorm(
+                vmin=plot_gdf[price_col].quantile(0.02),
+                vmax=plot_gdf[price_col].quantile(0.98),
+            )
+            sm2 = ScalarMappable(cmap=CMAP_CONTINUOUS, norm=p_norm)
+            sm2.set_array([])
+            plot_gdf.plot(
+                ax=ax_price,
+                column=price_col,
+                cmap=CMAP_CONTINUOUS,
+                norm=p_norm,
+                markersize=4,
+                alpha=0.8,
+                legend=False,
+            )
+            cbar2 = fig.colorbar(sm2, ax=ax_price, fraction=0.03, pad=0.02)
+            cbar2.ax.yaxis.set_tick_params(color="white", labelsize=7)
+            cbar2.ax.tick_params(labelcolor="white")
+            cbar2.outline.set_edgecolor("#444444")
+            ax_price.set_title(f"{price_label}", color="white", fontsize=10)
+            try:
+                ctx.add_basemap(ax_price, **basemap_kwargs)
+            except Exception:
+                pass
+        ax_price.set_title(price_label, color="white", fontsize=10)
+        ax_price.set_axis_off()
+
+        fig.suptitle("RCN Transaction Summary", color="white", fontsize=14, y=1.01)
+        plt.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor=BG)
+        plt.close(fig)
+        logger.info("Plot saved to %s", output_path)
+
     def run(self, table: str = "transactions") -> gpd.GeoDataFrame:
         gdf = self.download()
         if self.process_data:
             gdf = self.clean(gdf)
             gdf = self.preprocess(gdf)
         self.save(gdf, table=table)
+        self.plot_transactions(gdf, output_path=str(Path(__file__).parent / "data_plot.png"))
         logger.info("Pipeline run finished.")
         return gdf
 
 
 if __name__ == "__main__":
+    _here = Path(__file__).parent
     pipeline = RCNTransactionPipeline(
+        area_file=str(_here / "mokotow_district.geojson"),
         save_format="both",
-        db_path="lokale_wilanow.duckdb",
-        parquet_path="lokale_wilanow.parquet"
+        db_path=str(_here / "lokale_mokotow.duckdb"),
+        parquet_path=str(_here / "lokale_mokotow.parquet"),
     )
     pipeline.run()
